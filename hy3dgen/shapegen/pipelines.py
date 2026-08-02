@@ -136,6 +136,21 @@ class Hunyuan3DDiTPipeline:
     model_cpu_offload_seq = "conditioner->model->vae"
     _exclude_from_cpu_offload = []
 
+    @property
+    def components(self):
+        # Diffusers-style component registry. Needed by the inherited
+        # enable_model_cpu_offload() (copied from diffusers) so it can attach
+        # accelerate CPU-offload hooks to the current sub-modules. It is a live
+        # property so it always reflects sub-modules replaced later, e.g. the
+        # flashvdm VAE installed by enable_flashvdm().
+        return {
+            'vae': self.vae,
+            'model': self.model,
+            'scheduler': self.scheduler,
+            'conditioner': self.conditioner,
+            'image_processor': self.image_processor,
+        }
+
     @classmethod
     @synchronize_timer('Hunyuan3DDiTPipeline Model Loading')
     def from_single_file(

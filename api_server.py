@@ -18,6 +18,8 @@ A model worker executes the model.
 import argparse
 import asyncio
 import base64
+import ctypes
+import gc
 import logging
 import logging.handlers
 import os
@@ -149,26 +151,83 @@ class ModelWorker:
                  tex_model_path='tencent/Hunyuan3D-2',
                  subfolder='hunyuan3d-dit-v2-mini-turbo',
                  device='cuda',
-                 enable_tex=False):
+                 enable_tex=False,
+                 low_vram_mode=False):
+        # NOTE: low_vram_mode is accepted for CLI/script compatibility. Since
+        # models are now unloaded to disk after every job there is no resident
+        # VRAM/RAM footprint left to manage between requests.
         self.model_path = model_path
+        self.tex_model_path = tex_model_path
+        self.subfolder = subfolder
         self.worker_id = worker_id
         self.device = device
-        logger.info(f"Loading the model {model_path} on worker {worker_id} ...")
+        self.enable_tex = enable_tex
+        # Serialize jobs: pipelines are created/destroyed per request, so
+        # concurrent requests must not race on the model lifecycle.
+        self._lock = threading.Lock()
+        logger.info(f"Creating worker {worker_id} (shape={model_path}/{subfolder}, tex={enable_tex}) ...")
 
+        # Small ONNX model used for background removal; stays resident.
         self.rembg = BackgroundRemover()
-        self.pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-            model_path,
-            subfolder=subfolder,
-            use_safetensors=True,
-            device=device,
-        )
-        self.pipeline.enable_flashvdm(mc_algo='mc')
-        # self.pipeline_t2i = HunyuanDiTPipeline(
-        #     'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled',
-        #     device=device
-        # )
-        if enable_tex:
-            self.pipeline_tex = Hunyuan3DPaintPipeline.from_pretrained(tex_model_path)
+
+        # Pipelines are loaded lazily from disk per request and released
+        # (GPU + RAM) as soon as the request finishes. Only one pipeline is
+        # ever resident at a time, so both VRAM and system RAM return to
+        # near-idle between requests and full-size models become runnable on
+        # a 12 GB card that could never hold shape + texture simultaneously.
+        self.pipeline = None
+        self.pipeline_tex = None
+        torch.cuda.empty_cache()
+
+    @staticmethod
+    def _free_memory():
+        """GC + release cached CUDA blocks + return freed heap pages to the OS."""
+        gc.collect()
+        torch.cuda.empty_cache()
+        try:
+            ctypes.CDLL('libc.so.6').malloc_trim(0)
+        except Exception:
+            pass
+
+    # -- shape pipeline ---------------------------------------------------------
+    def _load_shape(self):
+        if self.pipeline is None:
+            logger.info("Loading shape pipeline from disk ...")
+            self.pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+                self.model_path,
+                subfolder=self.subfolder,
+                use_safetensors=True,
+                device=self.device,
+            )
+            self.pipeline.enable_flashvdm(mc_algo='mc')
+            torch.cuda.empty_cache()
+        return self.pipeline
+
+    def _release_shape(self):
+        if self.pipeline is not None:
+            logger.info("Unloading shape pipeline from GPU and RAM ...")
+            del self.pipeline
+            self.pipeline = None
+            self._free_memory()
+
+    # -- texture pipeline -------------------------------------------------------
+    def _load_tex(self):
+        if self.pipeline_tex is None:
+            logger.info("Loading texture pipeline from disk ...")
+            self.pipeline_tex = Hunyuan3DPaintPipeline.from_pretrained(self.tex_model_path)
+            # Texture models stream GPU<->CPU during generation; once the job
+            # finishes the whole pipeline is released so nothing stays in RAM.
+            logger.info("Enabling model CPU offload for texture generation")
+            self.pipeline_tex.enable_model_cpu_offload()
+            torch.cuda.empty_cache()
+        return self.pipeline_tex
+
+    def _release_tex(self):
+        if self.pipeline_tex is not None:
+            logger.info("Unloading texture pipeline from GPU and RAM ...")
+            del self.pipeline_tex
+            self.pipeline_tex = None
+            self._free_memory()
 
     def get_queue_length(self):
         if model_semaphore is None:
@@ -185,6 +244,11 @@ class ModelWorker:
 
     @torch.inference_mode()
     def generate(self, uid, params):
+        # Pipelines are created and destroyed per request, so serialize jobs.
+        with self._lock:
+            return self._generate_locked(uid, params)
+
+    def _generate_locked(self, uid, params):
         if 'image' in params:
             image = params["image"]
             image = load_image_from_base64(image)
@@ -201,22 +265,36 @@ class ModelWorker:
         if 'mesh' in params:
             mesh = trimesh.load(BytesIO(base64.b64decode(params["mesh"])), file_type='glb')
         else:
-            seed = params.get("seed", 1234)
-            params['generator'] = torch.Generator(self.device).manual_seed(seed)
-            params['octree_resolution'] = params.get("octree_resolution", 128)
-            params['num_inference_steps'] = params.get("num_inference_steps", 5)
-            params['guidance_scale'] = params.get('guidance_scale', 5.0)
-            params['mc_algo'] = 'mc'
-            import time
-            start_time = time.time()
-            mesh = self.pipeline(**params)[0]
-            logger.info("--- %s seconds ---" % (time.time() - start_time))
+            self._load_shape()
+            try:
+                seed = params.get("seed", 1234)
+                params['generator'] = torch.Generator(self.device).manual_seed(seed)
+                params['octree_resolution'] = params.get("octree_resolution", 128)
+                params['num_inference_steps'] = params.get("num_inference_steps", 5)
+                params['guidance_scale'] = params.get('guidance_scale', 5.0)
+                params['mc_algo'] = 'mc'
+                import time
+                start_time = time.time()
+                mesh = self.pipeline(**params)[0]
+                logger.info("--- shape generation %s seconds ---" % (time.time() - start_time))
+            finally:
+                # Shape is not needed for texture generation and must not stay
+                # resident between jobs: free it (GPU + RAM) right away.
+                self._release_shape()
 
         if params.get('texture', False):
+            self._release_shape()
             mesh = FloaterRemover()(mesh)
             mesh = DegenerateFaceRemover()(mesh)
             mesh = FaceReducer()(mesh, max_facenum=params.get('face_count', 40000))
-            mesh = self.pipeline_tex(mesh, image)
+            try:
+                self._load_tex()
+                import time
+                start_time = time.time()
+                mesh = self.pipeline_tex(mesh, image)
+                logger.info("--- texture generation %s seconds ---" % (time.time() - start_time))
+            finally:
+                self._release_tex()
 
         type = params.get('type', 'glb')
         with tempfile.NamedTemporaryFile(suffix=f'.{type}', delete=False) as temp_file:
@@ -225,7 +303,7 @@ class ModelWorker:
             save_path = os.path.join(SAVE_DIR, f'{str(uid)}.{type}')
             mesh.export(save_path)
 
-        torch.cuda.empty_cache()
+        self._free_memory()
         return save_path, uid
 
 
@@ -306,11 +384,14 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--limit-model-concurrency", type=int, default=5)
     parser.add_argument('--enable_tex', action='store_true')
+    parser.add_argument('--low_vram_mode', action='store_true')
+    parser.add_argument('--subfolder', type=str, default='hunyuan3d-dit-v2-mini-turbo')
     args = parser.parse_args()
     logger.info(f"args: {args}")
 
     model_semaphore = asyncio.Semaphore(args.limit_model_concurrency)
 
     worker = ModelWorker(model_path=args.model_path, device=args.device, enable_tex=args.enable_tex,
-                         tex_model_path=args.tex_model_path)
+                         tex_model_path=args.tex_model_path, subfolder=args.subfolder,
+                         low_vram_mode=args.low_vram_mode)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

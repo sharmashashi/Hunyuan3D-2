@@ -12,9 +12,12 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+import ctypes
+import gc
 import os
 import random
 import shutil
+import threading
 import time
 from glob import glob
 from pathlib import Path
@@ -30,6 +33,13 @@ import uuid
 from hy3dgen.shapegen.utils import logger
 
 MAX_SEED = int(1e7)
+
+# Pipelines are loaded lazily from disk per request and released (GPU + RAM)
+# after each job, so only one pipeline is ever resident and both VRAM and
+# system RAM stay low between requests.
+i23d_worker = None
+texgen_worker = None
+_model_lock = threading.Lock()
 
 
 def get_example_img_list():
@@ -132,6 +142,67 @@ def build_model_viewer_html(save_folder, height=660, width=790, textured=False):
     """
 
 
+def free_memory():
+    gc.collect()
+    torch.cuda.empty_cache()
+    try:
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except Exception:
+        pass
+
+
+def load_shape_worker():
+    global i23d_worker
+    if i23d_worker is None:
+        logger.info("Loading shape pipeline from disk ...")
+        from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
+        i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+            args.model_path,
+            subfolder=args.subfolder,
+            use_safetensors=True,
+            device=args.device,
+        )
+        if args.enable_flashvdm:
+            mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
+            i23d_worker.enable_flashvdm(mc_algo=mc_algo)
+        if args.compile:
+            i23d_worker.compile()
+        torch.cuda.empty_cache()
+    return i23d_worker
+
+
+def release_shape_worker():
+    global i23d_worker
+    if i23d_worker is not None:
+        logger.info("Unloading shape pipeline from GPU and RAM ...")
+        del i23d_worker
+        i23d_worker = None
+        free_memory()
+
+
+def load_tex_worker():
+    global texgen_worker
+    if texgen_worker is None:
+        logger.info("Loading texture pipeline from disk ...")
+        from hy3dgen.texgen import Hunyuan3DPaintPipeline
+        texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
+        # Texture models stream GPU<->CPU during generation; once the job
+        # finishes the whole pipeline is released so nothing stays in RAM.
+        logger.info("Enabling model CPU offload for texture generation")
+        texgen_worker.enable_model_cpu_offload()
+        torch.cuda.empty_cache()
+    return texgen_worker
+
+
+def release_tex_worker():
+    global texgen_worker
+    if texgen_worker is not None:
+        logger.info("Unloading texture pipeline from GPU and RAM ...")
+        del texgen_worker
+        texgen_worker = None
+        free_memory()
+
+
 def _gen_shape(
     caption=None,
     image=None,
@@ -215,7 +286,7 @@ def _gen_shape(
 
     generator = torch.Generator()
     generator = generator.manual_seed(int(seed))
-    outputs = i23d_worker(
+    outputs = load_shape_worker()(
         image=image,
         num_inference_steps=steps,
         guidance_scale=guidance_scale,
@@ -254,47 +325,51 @@ def generation_all(
     num_chunks=200000,
     randomize_seed: bool = False,
 ):
-    start_time_0 = time.time()
-    mesh, image, save_folder, stats, seed = _gen_shape(
-        caption,
-        image,
-        mv_image_front=mv_image_front,
-        mv_image_back=mv_image_back,
-        mv_image_left=mv_image_left,
-        mv_image_right=mv_image_right,
-        steps=steps,
-        guidance_scale=guidance_scale,
-        seed=seed,
-        octree_resolution=octree_resolution,
-        check_box_rembg=check_box_rembg,
-        num_chunks=num_chunks,
-        randomize_seed=randomize_seed,
-    )
-    path = export_mesh(mesh, save_folder, textured=False)
+    # Models are loaded from disk and released (GPU + RAM) after each job, so
+    # only one pipeline is ever resident at a time.
+    with _model_lock:
+        try:
+            start_time_0 = time.time()
+            mesh, image, save_folder, stats, seed = _gen_shape(
+                caption,
+                image,
+                mv_image_front=mv_image_front,
+                mv_image_back=mv_image_back,
+                mv_image_left=mv_image_left,
+                mv_image_right=mv_image_right,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                seed=seed,
+                octree_resolution=octree_resolution,
+                check_box_rembg=check_box_rembg,
+                num_chunks=num_chunks,
+                randomize_seed=randomize_seed,
+            )
+            path = export_mesh(mesh, save_folder, textured=False)
 
-    # tmp_time = time.time()
-    # mesh = floater_remove_worker(mesh)
-    # mesh = degenerate_face_remove_worker(mesh)
-    # logger.info("---Postprocessing takes %s seconds ---" % (time.time() - tmp_time))
-    # stats['time']['postprocessing'] = time.time() - tmp_time
+            tmp_time = time.time()
+            mesh = face_reduce_worker(mesh)
+            logger.info("---Face Reduction takes %s seconds ---" % (time.time() - tmp_time))
+            stats['time']['face reduction'] = time.time() - tmp_time
 
-    tmp_time = time.time()
-    mesh = face_reduce_worker(mesh)
-    logger.info("---Face Reduction takes %s seconds ---" % (time.time() - tmp_time))
-    stats['time']['face reduction'] = time.time() - tmp_time
+            # Shape is no longer needed: release it (GPU + RAM) before loading
+            # the texture pipeline so only one pipeline is ever resident.
+            release_shape_worker()
 
-    tmp_time = time.time()
-    textured_mesh = texgen_worker(mesh, image)
-    logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
-    stats['time']['texture generation'] = time.time() - tmp_time
-    stats['time']['total'] = time.time() - start_time_0
+            tmp_time = time.time()
+            textured_mesh = load_tex_worker()(mesh, image)
+            logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
+            stats['time']['texture generation'] = time.time() - tmp_time
+            stats['time']['total'] = time.time() - start_time_0
 
-    textured_mesh.metadata['extras'] = stats
-    path_textured = export_mesh(textured_mesh, save_folder, textured=True)
-    model_viewer_html_textured = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
-                                                         textured=True)
-    if args.low_vram_mode:
-        torch.cuda.empty_cache()
+            textured_mesh.metadata['extras'] = stats
+            path_textured = export_mesh(textured_mesh, save_folder, textured=True)
+            model_viewer_html_textured = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
+                                                                 textured=True)
+        finally:
+            # Guaranteed release on success AND on error.
+            release_tex_worker()
+            release_shape_worker()
     return (
         gr.update(value=path),
         gr.update(value=path_textured),
@@ -319,29 +394,33 @@ def shape_generation(
     num_chunks=200000,
     randomize_seed: bool = False,
 ):
-    start_time_0 = time.time()
-    mesh, image, save_folder, stats, seed = _gen_shape(
-        caption,
-        image,
-        mv_image_front=mv_image_front,
-        mv_image_back=mv_image_back,
-        mv_image_left=mv_image_left,
-        mv_image_right=mv_image_right,
-        steps=steps,
-        guidance_scale=guidance_scale,
-        seed=seed,
-        octree_resolution=octree_resolution,
-        check_box_rembg=check_box_rembg,
-        num_chunks=num_chunks,
-        randomize_seed=randomize_seed,
-    )
-    stats['time']['total'] = time.time() - start_time_0
-    mesh.metadata['extras'] = stats
+    # Models are loaded from disk and released (GPU + RAM) after each job, so
+    # nothing stays resident between requests.
+    with _model_lock:
+        try:
+            start_time_0 = time.time()
+            mesh, image, save_folder, stats, seed = _gen_shape(
+                caption,
+                image,
+                mv_image_front=mv_image_front,
+                mv_image_back=mv_image_back,
+                mv_image_left=mv_image_left,
+                mv_image_right=mv_image_right,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                seed=seed,
+                octree_resolution=octree_resolution,
+                check_box_rembg=check_box_rembg,
+                num_chunks=num_chunks,
+                randomize_seed=randomize_seed,
+            )
+            stats['time']['total'] = time.time() - start_time_0
+            mesh.metadata['extras'] = stats
 
-    path = export_mesh(mesh, save_folder, textured=False)
-    model_viewer_html = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH)
-    if args.low_vram_mode:
-        torch.cuda.empty_cache()
+            path = export_mesh(mesh, save_folder, textured=False)
+            model_viewer_html = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH)
+        finally:
+            release_shape_worker()
     return (
         gr.update(value=path),
         model_viewer_html,
@@ -692,17 +771,10 @@ if __name__ == '__main__':
     HAS_TEXTUREGEN = False
     if not args.disable_tex:
         try:
+            # Importability check only: the texture pipeline itself is loaded
+            # lazily on first textured generation and released after each job
+            # (see load_tex_worker/release_tex_worker).
             from hy3dgen.texgen import Hunyuan3DPaintPipeline
-
-            texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
-            if args.low_vram_mode:
-                texgen_worker.enable_model_cpu_offload()
-            # Not help much, ignore for now.
-            # if args.compile:
-            #     texgen_worker.models['delight_model'].pipeline.unet.compile()
-            #     texgen_worker.models['delight_model'].pipeline.vae.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.unet.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.vae.compile()
             HAS_TEXTUREGEN = True
         except Exception as e:
             print(e)
@@ -717,23 +789,14 @@ if __name__ == '__main__':
         t2i_worker = HunyuanDiTPipeline('Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled', device=args.device)
         HAS_T2I = True
 
-    from hy3dgen.shapegen import FaceReducer, FloaterRemover, DegenerateFaceRemover, MeshSimplifier, \
-        Hunyuan3DDiTFlowMatchingPipeline
+    from hy3dgen.shapegen import FaceReducer, FloaterRemover, DegenerateFaceRemover, MeshSimplifier
     from hy3dgen.shapegen.pipelines import export_to_trimesh
     from hy3dgen.rembg import BackgroundRemover
 
     rmbg_worker = BackgroundRemover()
-    i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-        args.model_path,
-        subfolder=args.subfolder,
-        use_safetensors=True,
-        device=args.device,
-    )
-    if args.enable_flashvdm:
-        mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
-        i23d_worker.enable_flashvdm(mc_algo=mc_algo)
-    if args.compile:
-        i23d_worker.compile()
+    # The shape pipeline is loaded lazily on first use and released (GPU + RAM)
+    # after each job (see load_shape_worker/release_shape_worker).
+    i23d_worker = None
 
     floater_remove_worker = FloaterRemover()
     degenerate_face_remove_worker = DegenerateFaceRemover()
